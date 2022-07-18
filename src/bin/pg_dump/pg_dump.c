@@ -58,6 +58,7 @@
 #include "dumputils.h"
 #include "fe_utils/option_utils.h"
 #include "fe_utils/string_utils.h"
+#include "filter.h"
 #include "getopt_long.h"
 #include "libpq/libpq-fs.h"
 #include "parallel.h"
@@ -317,6 +318,7 @@ static void appendReloptionsArrayAH(PQExpBuffer buffer, const char *reloptions,
 static char *get_synchronized_snapshot(Archive *fout);
 static void setupDumpWorker(Archive *AHX);
 static TableInfo *getRootTableInfo(const TableInfo *tbinfo);
+static void getFiltersFromFile(const char *filename, DumpOptions *dopt);
 
 
 int
@@ -389,6 +391,7 @@ main(int argc, char **argv)
 		{"enable-row-security", no_argument, &dopt.enable_row_security, 1},
 		{"exclude-table-data", required_argument, NULL, 4},
 		{"extra-float-digits", required_argument, NULL, 8},
+		{"filter", required_argument, NULL, 12},
 		{"if-exists", no_argument, &dopt.if_exists, 1},
 		{"inserts", no_argument, NULL, 9},
 		{"lock-wait-timeout", required_argument, NULL, 2},
@@ -620,6 +623,10 @@ main(int argc, char **argv)
 			case 11:			/* include foreign data */
 				simple_string_list_append(&foreign_servers_include_patterns,
 										  optarg);
+				break;
+
+			case 12:			/* object filters from file */
+				getFiltersFromFile(optarg, &dopt);
 				break;
 
 			default:
@@ -1027,6 +1034,8 @@ help(const char *progname)
 			 "                               access to)\n"));
 	printf(_("  --exclude-table-data=PATTERN do NOT dump data for the specified table(s)\n"));
 	printf(_("  --extra-float-digits=NUM     override default setting for extra_float_digits\n"));
+	printf(_("  --filter=FILENAME            dump objects and data based on the filter expressions\n"
+			 "                               in specified file\n"));
 	printf(_("  --if-exists                  use IF EXISTS when dropping objects\n"));
 	printf(_("  --include-foreign-data=PATTERN\n"
 			 "                               include data of foreign tables on foreign\n"
@@ -18129,4 +18138,94 @@ appendReloptionsArrayAH(PQExpBuffer buffer, const char *reloptions,
 								fout->std_strings);
 	if (!res)
 		pg_log_warning("could not parse %s array", "reloptions");
+}
+
+/*
+ * getFiltersFromFile - retrieve object identifer patterns from file
+ *
+ * Parse the specified filter file for include and exclude patterns, and add
+ * them to the relevant lists.  If the filename is "-" then filters will be
+ * read from STDIN rather than a file.
+ */
+static void
+getFiltersFromFile(const char *filename, DumpOptions *dopt)
+{
+	FilterStateData fstate;
+	bool		is_include;
+	char	   *objname;
+	FilterObjectType objtype;
+
+	fstate.filename = filename;
+	fstate.lineno = 0;
+	initStringInfo(&fstate.linebuff);
+
+	if (strcmp(filename, "-") != 0)
+	{
+		fstate.fp = fopen(filename, "r");
+		if (!fstate.fp)
+			pg_fatal("could not open filter file \"%s\": %m", filename);
+	}
+	else
+		fstate.fp = stdin;
+
+	while (read_filter_item(&fstate, &is_include, &objname, &objtype))
+	{
+		/* ignore comments and empty lines */
+		if (objtype == FILTER_OBJECT_TYPE_NONE)
+			continue;
+
+		if (objtype == FILTER_OBJECT_TYPE_DATA)
+		{
+			if (is_include)
+				exit_invalid_filter_format(&fstate,
+										   "include filter is not allowed for this type of object");
+			else
+				simple_string_list_append(&tabledata_exclude_patterns,
+										  objname);
+		}
+		else if (objtype == FILTER_OBJECT_TYPE_FOREIGN_DATA)
+		{
+			if (is_include)
+				simple_string_list_append(&foreign_servers_include_patterns,
+										  objname);
+			else
+				exit_invalid_filter_format(&fstate,
+										   "exclude filter is not allowed for this type of object");
+		}
+		else if (objtype == FILTER_OBJECT_TYPE_SCHEMA)
+		{
+			if (is_include)
+			{
+				simple_string_list_append(&schema_include_patterns,
+										  objname);
+				dopt->include_everything = false;
+			}
+			else
+				simple_string_list_append(&schema_exclude_patterns,
+										  objname);
+		}
+		else if (objtype == FILTER_OBJECT_TYPE_TABLE)
+		{
+			if (is_include)
+			{
+				simple_string_list_append(&table_include_patterns, objname);
+				dopt->include_everything = false;
+			}
+			else
+				simple_string_list_append(&table_exclude_patterns, objname);
+		}
+		else
+			exit_unsupported_filter_object_type(&fstate, "pg_dump", objtype);
+
+		if (objname)
+			free(objname);
+	}
+
+	free(fstate.linebuff.data);
+
+	if (fstate.fp != stdin)
+	{
+		if (fclose(fstate.fp) != 0)
+			pg_fatal("could not close filter file \"%s\": %m", fstate.filename);
+	}
 }
