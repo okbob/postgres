@@ -518,20 +518,10 @@ getFiltersFromFile(const char *filename, RestoreOptions *opts)
 	char	   *objname;
 	FilterObjectType objtype;
 
-	fstate.filename = filename;
-	fstate.lineno = 0;
-	initStringInfo(&fstate.linebuff);
+	if (!filter_init(&fstate, filename))
+		exit_nicely(1);
 
-	if (strcmp(filename, "-") != 0)
-	{
-		fstate.fp = fopen(filename, "r");
-		if (!fstate.fp)
-			pg_fatal("could not open filter file \"%s\": %m", filename);
-	}
-	else
-		fstate.fp = stdin;
-
-	while (read_filter_item(&fstate, &is_include, &objname, &objtype))
+	while (filter_read_item(&fstate, &is_include, &objname, &objtype))
 	{
 		/* ignore comments or empty lines */
 		if (objtype == FILTER_OBJECT_TYPE_NONE)
@@ -546,8 +536,11 @@ getFiltersFromFile(const char *filename, RestoreOptions *opts)
 				simple_string_list_append(&opts->functionNames, objname);
 			}
 			else
-				exit_invalid_filter_format(&fstate,
+			{
+				log_invalid_filter_format(&fstate,
 										   "exclude filter is not allowed for this type of object");
+				break;
+			}
 		}
 		else if (objtype == FILTER_OBJECT_TYPE_INDEX)
 		{
@@ -558,8 +551,11 @@ getFiltersFromFile(const char *filename, RestoreOptions *opts)
 				simple_string_list_append(&opts->indexNames, objname);
 			}
 			else
-				exit_invalid_filter_format(&fstate,
+			{
+				log_invalid_filter_format(&fstate,
 										   "exclude filter is not allowed for this type of object");
+				break;
+			}
 		}
 		else if (objtype == FILTER_OBJECT_TYPE_SCHEMA)
 		{
@@ -577,8 +573,11 @@ getFiltersFromFile(const char *filename, RestoreOptions *opts)
 				simple_string_list_append(&opts->tableNames, objname);
 			}
 			else
-				exit_invalid_filter_format(&fstate,
+			{
+				log_invalid_filter_format(&fstate,
 										   "exclude filter is not allowed for this type of object");
+				break;
+			}
 		}
 		else if (objtype == FILTER_OBJECT_TYPE_TRIGGER)
 		{
@@ -589,21 +588,23 @@ getFiltersFromFile(const char *filename, RestoreOptions *opts)
 				simple_string_list_append(&opts->triggerNames, optarg);
 			}
 			else
-				exit_invalid_filter_format(&fstate,
+			{
+				log_invalid_filter_format(&fstate,
 										   "exclude filter is not allowed for this type of object");
+				break;
+			}
 		}
 		else
-			exit_unsupported_filter_object_type(&fstate, "pg_restore", objtype);
+		{
+			log_unsupported_filter_object_type(&fstate, "pg_restore", objtype);
+			break;
+		}
 
 		if (objname)
 			free(objname);
 	}
 
-	free(fstate.linebuff.data);
-
-	if (fstate.fp != stdin)
-	{
-		if (fclose(fstate.fp) != 0)
-			pg_fatal("could not close filter file \"%s\": %m", fstate.filename);
-	}
+	filter_free_sources(&fstate);
+	if (fstate.is_error)
+		exit_nicely(1);
 }

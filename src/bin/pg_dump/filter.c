@@ -17,20 +17,74 @@
 #include "common/fe_memutils.h"
 #include "common/string.h"
 #include "lib/stringinfo.h"
-#include "pg_backup_utils.h"
 #include "pqexpbuffer.h"
 
 #define		is_keyword_str(cstr, str, bytes) \
 	((strlen(cstr) == bytes) && (pg_strncasecmp(cstr, str, bytes) == 0))
 
 /*
- * exit_invalid_filter_format - Emit error message, close the file and exit
+ * Following routines are called from pg_dump, pg_dumpall and pg_restore.
+ * Unfortunatelly, implementation of exit_nicely in pg_dump and pg_restore
+ * is different from implementation of this rutine in pg_dumpall. So instead
+ * direct calling exit_nicely we have to return some error flag (in this
+ * case NULL), and exit_nicelly will be executed from caller's routine.
+ */
+
+/*
+ * Simple routines - just don't repeat same code
+ *
+ * Returns true, when filter's file is opened
+ */
+bool
+filter_init(FilterStateData *fstate, const char *filename)
+{
+	fstate->filename = filename;
+	fstate->lineno = 0;
+	initStringInfo(&fstate->linebuff);
+
+	if (strcmp(filename, "-") != 0)
+	{
+		fstate->fp = fopen(filename, "r");
+		if (!fstate->fp)
+		{
+			pg_log_error("could not open filter file \"%s\": %m", filename);
+			return false;
+		}
+	}
+	else
+		fstate->fp = stdin;
+
+	fstate->is_error = false;
+
+	return true;
+}
+
+/*
+ * Release allocated sources for filter
+ */
+void
+filter_free_sources(FilterStateData *fstate)
+{
+	free(fstate->linebuff.data);
+	fstate->linebuff.data = NULL;
+
+	if (fstate->fp && fstate->fp != stdin)
+	{
+		if (fclose(fstate->fp) != 0)
+			pg_log_error("could not close filter file \"%s\": %m", fstate->filename);
+
+		fstate->fp = NULL;
+	}
+}
+
+/*
+ * log_format_error - Emit error message
  *
  * This is mostly a convenience routine to avoid duplicating file closing code
  * in multiple callsites.
  */
 void
-exit_invalid_filter_format(FilterStateData *fstate, char *message)
+log_invalid_filter_format(FilterStateData *fstate, char *message)
 {
 	if (fstate->fp != stdin)
 	{
@@ -38,16 +92,13 @@ exit_invalid_filter_format(FilterStateData *fstate, char *message)
 					 fstate->filename,
 					 fstate->lineno,
 					 message);
-
-		if (fclose(fstate->fp) != 0)
-			pg_fatal("could not close filter file \"%s\": %m", fstate->filename);
 	}
 	else
 		pg_log_error("invalid format of filter on line %d: %s",
 					 fstate->lineno,
 					 message);
 
-	exit_nicely(1);
+	fstate->is_error = true;
 }
 
 static const char *
@@ -82,7 +133,7 @@ filter_object_type_name(FilterObjectType fot)
  * Helper routine to reduce duplicated code
  */
 void
-exit_unsupported_filter_object_type(FilterStateData *fstate,
+log_unsupported_filter_object_type(FilterStateData *fstate,
 									const char *appname,
 									FilterObjectType fot)
 {
@@ -93,7 +144,7 @@ exit_unsupported_filter_object_type(FilterStateData *fstate,
 					  appname,
 					  filter_object_type_name(fot));
 
-	exit_invalid_filter_format(fstate, str->data);
+	log_invalid_filter_format(fstate, str->data);
 }
 
 /*
@@ -149,7 +200,10 @@ filter_get_pattern(FilterStateData *fstate,
 		str++;
 
 	if (*str == '\0')
-		exit_invalid_filter_format(fstate, "missing object name pattern");
+	{
+		log_invalid_filter_format(fstate, "missing object name pattern");
+		return NULL;
+	}
 
 	/*
 	 * If the object name pattern has been quoted, we must take care to parse
@@ -175,17 +229,12 @@ filter_get_pattern(FilterStateData *fstate,
 					{
 						pg_log_error("could not read from filter file \"%s\": %m",
 									 fstate->filename);
-						if (fstate->fp != stdin)
-						{
-							if (fclose(fstate->fp) != 0)
-								pg_fatal("could not close filter file \"%s\": %m",
-									  fstate->filename);
-						}
-
-						exit_nicely(1);
+						fstate->is_error = true;
 					}
+					else
+						log_invalid_filter_format(fstate, "unexpected end of file");
 
-					exit_invalid_filter_format(fstate, "unexpected end of file");
+					return NULL;
 				}
 
 				str = fstate->linebuff.data;
@@ -261,11 +310,13 @@ filter_get_pattern(FilterStateData *fstate,
  * message.
  */
 bool
-read_filter_item(FilterStateData *fstate,
+filter_read_item(FilterStateData *fstate,
 				 bool *is_include,
 				 char **objname,
 				 FilterObjectType *objtype)
 {
+	Assert(!fstate->is_error);
+
 	if (pg_get_line_buf(fstate->fp, &fstate->linebuff))
 	{
 		char	   *str = fstate->linebuff.data;
@@ -292,20 +343,29 @@ read_filter_item(FilterStateData *fstate,
 			 */
 			keyword = filter_get_keyword((const char **) &str, &size);
 			if (!keyword)
-				exit_invalid_filter_format(fstate,
+			{
+				log_invalid_filter_format(fstate,
 										   "no filter command found (expected \"include\" or \"exclude\")");
+				return false;
+			}
 
 			if (is_keyword_str("include", keyword, size))
 				*is_include = true;
 			else if (is_keyword_str("exclude", keyword, size))
 				*is_include = false;
 			else
-				exit_invalid_filter_format(fstate,
-										   "invalid filter command (expected \"include\" or \"exclude\")");
+			{
+				log_invalid_filter_format(fstate,
+										  "invalid filter command (expected \"include\" or \"exclude\")");
+				return false;
+			}
 
 			keyword = filter_get_keyword((const char **) &str, &size);
 			if (!keyword)
-				exit_invalid_filter_format(fstate, "missing filter object type");
+			{
+				log_invalid_filter_format(fstate, "missing filter object type");
+				return false;
+			}
 
 			if (is_keyword_str("data", keyword, size))
 				*objtype = FILTER_OBJECT_TYPE_DATA;
@@ -328,10 +388,13 @@ read_filter_item(FilterStateData *fstate,
 				PQExpBuffer str = createPQExpBuffer();
 
 				printfPQExpBuffer(str, "unsupported filter object type: \"%.*s\"", size, keyword);
-				exit_invalid_filter_format(fstate, str->data);
+				log_invalid_filter_format(fstate, str->data);
+				return false;
 			}
 
 			str = filter_get_pattern(fstate, str, objname);
+			if (!str)
+				return false;
 
 			/*
 			 * Look for any content after the object identifier. Comments and
@@ -343,8 +406,11 @@ read_filter_item(FilterStateData *fstate,
 				str++;
 
 			if (*str != '\0' && *str != '#')
-				exit_invalid_filter_format(fstate,
-										   "unexpected extra data after pattern");
+			{
+				log_invalid_filter_format(fstate,
+										  "unexpected extra data after pattern");
+				return false;
+			}
 		}
 		else
 		{
@@ -358,14 +424,7 @@ read_filter_item(FilterStateData *fstate,
 	if (ferror(fstate->fp))
 	{
 		pg_log_error("could not read from filter file \"%s\": %m", fstate->filename);
-
-		if (fstate->fp != stdin)
-		{
-			if (fclose(fstate->fp) != 0)
-				pg_fatal("could not close filter file \"%s\": %m", fstate->filename);
-		}
-
-		exit_nicely(1);
+		fstate->is_error = true;
 	}
 
 	return false;

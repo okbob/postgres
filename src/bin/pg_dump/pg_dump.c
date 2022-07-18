@@ -18155,20 +18155,10 @@ getFiltersFromFile(const char *filename, DumpOptions *dopt)
 	char	   *objname;
 	FilterObjectType objtype;
 
-	fstate.filename = filename;
-	fstate.lineno = 0;
-	initStringInfo(&fstate.linebuff);
+	if (!filter_init(&fstate, filename))
+		exit_nicely(1);
 
-	if (strcmp(filename, "-") != 0)
-	{
-		fstate.fp = fopen(filename, "r");
-		if (!fstate.fp)
-			pg_fatal("could not open filter file \"%s\": %m", filename);
-	}
-	else
-		fstate.fp = stdin;
-
-	while (read_filter_item(&fstate, &is_include, &objname, &objtype))
+	while (filter_read_item(&fstate, &is_include, &objname, &objtype))
 	{
 		/* ignore comments and empty lines */
 		if (objtype == FILTER_OBJECT_TYPE_NONE)
@@ -18177,8 +18167,11 @@ getFiltersFromFile(const char *filename, DumpOptions *dopt)
 		if (objtype == FILTER_OBJECT_TYPE_DATA)
 		{
 			if (is_include)
-				exit_invalid_filter_format(&fstate,
-										   "include filter is not allowed for this type of object");
+			{
+				log_invalid_filter_format(&fstate,
+										  "include filter is not allowed for this type of object");
+				break;
+			}
 			else
 				simple_string_list_append(&tabledata_exclude_patterns,
 										  objname);
@@ -18189,8 +18182,11 @@ getFiltersFromFile(const char *filename, DumpOptions *dopt)
 				simple_string_list_append(&foreign_servers_include_patterns,
 										  objname);
 			else
-				exit_invalid_filter_format(&fstate,
-										   "exclude filter is not allowed for this type of object");
+			{
+				log_invalid_filter_format(&fstate,
+										  "exclude filter is not allowed for this type of object");
+				break;
+			}
 		}
 		else if (objtype == FILTER_OBJECT_TYPE_SCHEMA)
 		{
@@ -18215,17 +18211,17 @@ getFiltersFromFile(const char *filename, DumpOptions *dopt)
 				simple_string_list_append(&table_exclude_patterns, objname);
 		}
 		else
-			exit_unsupported_filter_object_type(&fstate, "pg_dump", objtype);
+		{
+			log_unsupported_filter_object_type(&fstate, "pg_dump", objtype);
+			break;
+		}
 
 		if (objname)
 			free(objname);
 	}
 
-	free(fstate.linebuff.data);
+	filter_free_sources(&fstate);
 
-	if (fstate.fp != stdin)
-	{
-		if (fclose(fstate.fp) != 0)
-			pg_fatal("could not close filter file \"%s\": %m", fstate.filename);
-	}
+	if (fstate.is_error)
+		exit_nicely(1);
 }

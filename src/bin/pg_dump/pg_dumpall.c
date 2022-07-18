@@ -1744,7 +1744,6 @@ executeCommand(PGconn *conn, const char *query)
 	PQclear(res);
 }
 
-
 /*
  * dumpTimestamp
  */
@@ -1773,20 +1772,10 @@ getDatabaseExcludeFiltersFromFile(const char *filename, SimpleStringList *patter
 	char	   *objname;
 	FilterObjectType objtype;
 
-	fstate.filename = filename;
-	fstate.lineno = 0;
-	initStringInfo(&fstate.linebuff);
+	if (!filter_init(&fstate, filename))
+		exit_nicely(1);
 
-	if (strcmp(filename, "-") != 0)
-	{
-		fstate.fp = fopen(filename, "r");
-		if (!fstate.fp)
-			pg_fatal("could not open filter file \"%s\": %m", filename);
-	}
-	else
-		fstate.fp = stdin;
-
-	while (read_filter_item(&fstate, &is_include, &objname, &objtype))
+	while (filter_read_item(&fstate, &is_include, &objname, &objtype))
 	{
 		if (objtype == FILTER_OBJECT_TYPE_NONE)
 			continue;
@@ -1796,21 +1785,24 @@ getDatabaseExcludeFiltersFromFile(const char *filename, SimpleStringList *patter
 			if (!is_include)
 				simple_string_list_append(pattern, objname);
 			else
-				exit_invalid_filter_format(&fstate,
+			{
+				log_invalid_filter_format(&fstate,
 										   "include database filter is not suppported");
+				break;
+			}
 		}
 		else
-			exit_unsupported_filter_object_type(&fstate, "pg_dumpall", objtype);
+		{
+			log_unsupported_filter_object_type(&fstate, "pg_dumpall", objtype);
+			break;
+		}
 
 		if (objname)
 			free(objname);
 	}
 
-	free(fstate.linebuff.data);
+	filter_free_sources(&fstate);
 
-	if (fstate.fp != stdin)
-	{
-		if (fclose(fstate.fp) != 0)
-			pg_fatal("could not close filter file \"%s\": %m", fstate.filename);
-	}
+	if (fstate.is_error)
+		exit_nicely(1);
 }

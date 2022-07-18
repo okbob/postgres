@@ -25,6 +25,7 @@ typedef struct
 	const char *filename;
 	int			lineno;
 	StringInfoData linebuff;
+	bool		is_error;
 }			FilterStateData;
 
 /*
@@ -43,9 +44,12 @@ typedef enum
 	FILTER_OBJECT_TYPE_TRIGGER,
 }			FilterObjectType;
 
-extern void exit_invalid_filter_format(FilterStateData *fstate, char *message);
-extern void exit_unsupported_filter_object_type(FilterStateData *fstate,
+extern bool filter_init(FilterStateData *fstate, const char *filename);
+extern void filter_free_sources(FilterStateData *fstate);
+
+extern void log_invalid_filter_format(FilterStateData *fstate, char *message);
+extern void log_unsupported_filter_object_type(FilterStateData *fstate,
 												const char *appname, FilterObjectType fot);
-extern bool read_filter_item(FilterStateData *fstate, bool *is_include, char **objname, FilterObjectType *objtype);
+extern bool filter_read_item(FilterStateData *fstate, bool *is_include, char **objname, FilterObjectType *objtype);
 
 #endif
